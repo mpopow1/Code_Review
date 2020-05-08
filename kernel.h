@@ -43,7 +43,6 @@ typedef struct {
 
 	//Intermediate Inputs - calculated from the above inputs
 	float LOS_Rotation[3]; //aligns aircraft LOS to the Earth frame of reference
-	int H_elevation; //relative to the horizontal plane positioned at the aircraft body (post rotation)
 	float RN;		// reference slant range
 	float RM;       // reference slant range
 

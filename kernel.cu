@@ -8,11 +8,11 @@
 #include "kernel.h"
 
 //Device memory pointers on the device (for convenience)
-__device__ DTEDFile *dted;
-__device__ short    *elevations; //required because data pointer cannot be passed to dted.elevations from the host
-__device__ bool     *visible; //parallel to elevations
-__device__ Aircraft_Data *avData; // Yes, I am aware that it is more efficient to use a struct of arrays rather than an array of structs
-__device__ SlantRangeData *rangeData;
+__device__ DTEDFile *dted;            // Points to the parameters from the DTED file
+__device__ short    *elevations;      // Contains all the elevation samples from the DTED file, and directly maps to the area covered by the file.
+__device__ bool     *visible;         // Parallel to elevations, true indicates that that location is visible from the aircraft's current location
+__device__ Aircraft_Data *avData;     // Contains the aircraft data (location, orientation and target location result).  Yes, I am aware that it is more efficient to use a struct of arrays rather than an array of structs
+__device__ SlantRangeData *rangeData; // Contains components for the slant range calculation
 
 //Device memory pointers on the host
 static DTEDFile* d_DTEDFile;
@@ -21,6 +21,20 @@ static bool* d_visible;
 static Aircraft_Data* d_AV_Data;
 static SlantRangeData* d_rangeData;
 
+//==================================================================================================================================================
+//------------------------------------------ Computing Slant Range kernels and functions ------------------------------------------------------------
+
+/*===================================================================================================================================================
+	GetNearestPost(DTEDPost *post, double target_lat_seconds, double target_lon_seconds)
+
+Description
+	This device function determines the nearest location relative to the DTED elevation posts. It is a component to the algorithm GetElevationAt()
+	for extrapolating the terrain elevation at the target location.
+Parameters
+	post               - pointer to the output DTED post (the elevation sample and corresponding location from the DTED file)
+	target_lat_seconds - the target location latitude in arc seconds
+	target_lon_seconds - the target location longitude in arc seconds
+*/
 __device__ void GetNearestPost(DTEDPost *post, double target_lat_seconds, double target_lon_seconds)
 {
 	//peg lat and lon to the nearest post based on file resolution (post interval)
@@ -69,17 +83,32 @@ __device__ void GetNearestPost(DTEDPost *post, double target_lat_seconds, double
 	post->lon_arcseconds = (dted->lon_hemisphere == 'W') ? (dted->lon_degrees - 1) * 60 * 60 + post_lon : dted->lon_degrees * 60 * 60 + post_lon;
 }
 
+/*===================================================================================================================================================
+	GetElevationAt(double target_lat_seconds, double target_lon_seconds)
+
+Description
+	This device function calculates the terrain elevation at the target location using the elevation samples from a DTED file. Since DTED files have
+	a certain resolution, that is the terrain is unknown between elevation sample posts, the terrain elevation must be extrapolated from nearby posts
+	if the target location is somewhere between the posts. Therefore, this algorithm notes the locations and elevations of the four posts surrounding
+	the actual target location.  Next a linear function of the elevation is computed between opposing pairs from these four posts such that they are 
+	parallel either in the latitude or longitude direction.  Finally a linear function of the elevation is computed which connects these two lines 
+	together while intersecting the actual target location.  The elevation on the linear function at the target location is the extrapolated terrain
+	elevation at the target location.
+Parameters
+	target_lat_seconds   - expected target location latitude in arcseconds
+	target_lon_seconds   - expected target location longitude in arcseconds
+Output
+	An extrapolated teraain elevation for the anticipated target location.
+*/
 __device__ double GetElevationAt(double target_lat_seconds, double target_lon_seconds)
 {
 	//==============================================================================
-	// STEP 4
 	// Determine the starting post which is the DTED post nearest to the target location.
 	DTEDPost start_post;
 	GetNearestPost(&start_post, target_lat_seconds, target_lon_seconds);
 
 	//==============================================================================
-	// STEP 5
-	// Dtermine the latitude post. This is the DTED post which is directly north or
+	// Determine the latitude post. This is the DTED post which is directly north or
 	// south of the starting post in the latitude direction of the target location.
 	DTEDPost lat_post;
 	if (start_post.lat_arcseconds < target_lat_seconds)
@@ -99,7 +128,6 @@ __device__ double GetElevationAt(double target_lat_seconds, double target_lon_se
 	}
 
 	//==============================================================================
-	// STEP 6
 	// Determine the longitude post. This is the DTED post which is directly west or
 	// east of the starting post in the longitude direction of the target location.
 	DTEDPost lon_post;
@@ -120,7 +148,6 @@ __device__ double GetElevationAt(double target_lat_seconds, double target_lon_se
 	}
 
 	//==============================================================================
-	// STEP 7
 	// Determine the diagonal post. This is the DTED post which is directly diagonal
 	// from the starting post in the latitude and longitude direction of the target
 	// location.
@@ -128,7 +155,6 @@ __device__ double GetElevationAt(double target_lat_seconds, double target_lon_se
 	GetNearestPost(&diagonal_post, lat_post.lat_arcseconds, lon_post.lon_arcseconds);
 
 	//==============================================================================
-	// STEP 8
 	// Calculate the elevation directly west and east of the target location between
 	// the (starting and latitude posts) and (longitude and diagonal posts) respectively.
 	// Use simple line slope equation where the terrain elevation is the y and latitude
@@ -140,7 +166,6 @@ __device__ double GetElevationAt(double target_lat_seconds, double target_lon_se
 	double mid_lat_elevation2 = ((diagonal_post.elevation - lon_post.elevation) / 3.0) * abs(target_lat_seconds - lon_post.lat_arcseconds) + lon_post.elevation;
 
 	//==============================================================================
-	// STEP 9
 	// Calculate the elevation of the target location between the two points from
 	// step 6. Use simply line slope equation where the terrain elevation is the y
 	// and the longitude distance from the starting post to the target location is
@@ -163,6 +188,7 @@ __device__ double GetElevationAt(double target_lat_seconds, double target_lon_se
 
 	double final_elevation = ((mid_lat_elevation2 - mid_lat_elevation1) / 3.0) * abs(target_lon_seconds - start_post.lon_arcseconds) + mid_lat_elevation1;
 
+	//Debug
 	//printf("Lat Distance: %f | Lon Distance: %f | Mid elevation 1: %f | Mid elevation 2: %f | Target Elevation: %f\n", abs(start_post.lat_arcseconds - target_lat_seconds), abs(start_post.lon_arcseconds - target_lon_seconds), mid_lat_elevation1, mid_lat_elevation2, final_elevation);
 
 	return final_elevation;
@@ -176,7 +202,8 @@ Description
 	intersection between the LOS vector and Earth's terrain. It accomplishes this by testing a point along the LOS vector (one point per thread)
 	until the first point which is less than the terrain elevation at the same location relative to the LOS vector is found. Points along the LOS
 	vector are tested in segments the size of the thread block. If the point of intersect is not found, another iteration is performed further down
-	the LOS vector. This is repeated until either the target location is found or the number of iterations is exhausted (such as when looking up into the sky)
+	the LOS vector. That is the segment is shifted segment size down the LOS vector. This is repeated until either the target location is found or 
+	the number of iterations is exhausted (such as when looking up into the sky).
 Parameters
 	adata        - pointer to an Aircraft Data structure containing input data
 	rdata        - pointer to a Slant Range Data structure which is used to contain intermediate data in the calculation
@@ -192,7 +219,7 @@ __global__ void computeSlantRange(Aircraft_Data *adata, SlantRangeData *rdata = 
 {
 	const unsigned int index = (blockIdx.x * blockDim.x) + threadIdx.x;
 
-	//This data is uesd by all the threads simultaneously in this kernel. Reset to a known state and synchronize
+	//This data is used by all the threads simultaneously in this kernel. Reset to a known state and synchronize
 	if (index == 0)
 	{
 		rdata->iteration = 0;
@@ -202,13 +229,24 @@ __global__ void computeSlantRange(Aircraft_Data *adata, SlantRangeData *rdata = 
 	
 	__syncthreads();
 	
+	//Each thread operates on a specific location along the LOS vector within a "batch" of samples or sampling threads
+	//If no thread finds the LOS intersect with the terrain, the batch is moved further along the LOS vector on the next iteration
+	//This is repeated for a limited number of iterations until a thread finds the intersection
 	while (!rdata->found && rdata->iteration < MAX_ITERATIONS)
 	{
+		//Calculate the distance from the aircraft along the LOS vector - dependent on the current thread and the resolution of the 
+		//"step" along the LOS vector.  By default each "step" size is 1 meter. So, each thread is testing a location that is
+		//thread index meters from the aircraft with respect to the current iteration.
 		rdata->rng[index] = RANGE_RESOLUTION * (double)index + (NUM_THREADS * rdata->iteration);
 
+		//Calculate the latitude and longitude of the point on the ground beneath the test point on the LOS vector
 		rdata->lat[index] = adata->A_latitude  + (adata->LOS_Rotation[0] * rdata->rng[index]) / adata->RM;
 		rdata->lon[index] = adata->A_longitude + (adata->LOS_Rotation[1] * rdata->rng[index]) / (adata->RN * cos(adata->A_latitude));
+
+		//Calculate the altitude of the test point on the LOS vector
 		rdata->alt[index] = adata->A_altitude  - (adata->LOS_Rotation[2] * rdata->rng[index]);
+
+		//Calculate the terrain elevation of the point on the ground beneath the test point on the LOS vector
 		rdata->ele[index] = (float)GetElevationAt( abs(rdata->lat[index]) * RAD_TO_ARC, abs(rdata->lon[index]) * RAD_TO_ARC );
 		
 		//Print for debugging
@@ -216,20 +254,23 @@ __global__ void computeSlantRange(Aircraft_Data *adata, SlantRangeData *rdata = 
 
 		__syncthreads(); //synch threads for upcoming conditional statement
 
-		//Need the smallest altitude which is larger than the largest elevation along the vector
-		//Can't be the first index because that's the airplane. If it were, then the airplane has collided with the terrain
+		//Intersection is determined by the smallest altitude which is larger than the largest elevation along the LOS vector
+		//Can't be the first index because that's the aircraft. If it were, then the aircraft has collided with the terrain
+
 		//If the current altitude is less than the elevation (underground) and the previous altitude was not...
 		if (index > 0 && rdata->alt[index] < rdata->ele[index] && rdata->alt[index - 1] > rdata->ele[index - 1])
 		{
-			//...then record the index only if it is the smallest index
-			//It is implied that the smaller the index, the shorter the range.  The shortest possible range is desired because we don't want the location on the otherside of a mountain.
+			//...then record the index only if it is the smallest index. It is implied that the smaller the index, the shorter the range.
+			//The shortest possible range is desired because we don't want the location on the otherside of a mountain (imagine drawing the LOS vector through a mountain such that it emerges on the other side).
+
 			atomicMin(&(rdata->min_index), index); //FYI, If using visual studio, intellisense will flag atomic operations as errors.
 			rdata->found = true; //Indicate that the intersection has been found - this will terminate the loop
 		}
 		__syncthreads(); //Syncthreads for upcoming check and potential assignment operation
 
-		if (rdata->found && index == rdata->min_index)
+		if (rdata->found && index == rdata->min_index) //Make sure this is the thread that found the point of intersection.
 		{
+			//Assign its sample location data to the target location output
 			adata->slantRange  = rdata->rng[rdata->min_index];
 			adata->T_altitude  = rdata->alt[rdata->min_index];
 			adata->T_longitude = rdata->lon[rdata->min_index];
@@ -238,14 +279,27 @@ __global__ void computeSlantRange(Aircraft_Data *adata, SlantRangeData *rdata = 
 			//Print for debugging
 			//printf("FOUND TARGET: Caller Index: %d | Iteration: %d | Thread Index: %d | Range: %dm | Lat: %f | Lon: %f | Alt: %f | Elevation: %f\n", caller_index, rdata->iteration, index, (int)(adata->slantRange), adata->T_latitude * RAD_TO_DEG, adata->T_longitude * RAD_TO_DEG, rdata->alt[index], adata->T_altitude);
 		}
-		else
+		else //If the point of intersection hasn't been found yet...
 		{
-			if (index == 0) rdata->iteration += 1; //increment the number of iterations performed
-			__syncthreads(); //sync of the next iteration
+			if (index == 0) rdata->iteration += 1; //...increment the number of iterations performed
+			__syncthreads();                       //sync of the next iteration
 		}
 	}
 }
 
+/*===================================================================================================================================================
+	CalcTargetLocation(Aircraft_Data* AV_Data, DTEDFile* DTED_Data)
+
+Description
+	This host function is a wrapper for launching the computeSlantRange() kernel.  It loads the known aircraft data to the device, calls the kernel
+	and retrieves the result from the device. By default, it launches computeSlantRange() with 1 block of 512 threads. 
+Parameters
+	adata        - pointer to an Aircraft Data structure containing input data
+	rdata        - pointer to a Slant Range Data structure which is used to contain intermediate data in the calculation
+	caller_index - the index of the parent thread (with respect to its grid) which launched this kernel. Debug purposes only
+Output
+	This function prints out the target location to the screen including latitude, longitude, altitude (terrain elevation) and range from the aircraft.
+*/
 extern "C" void CalcTargetLocation(Aircraft_Data* AV_Data, DTEDFile* DTED_Data)
 {
 	Aircraft_Data* d_AV_Data;
@@ -253,7 +307,7 @@ extern "C" void CalcTargetLocation(Aircraft_Data* AV_Data, DTEDFile* DTED_Data)
 	cudaMemcpy(d_AV_Data, AV_Data, sizeof(Aircraft_Data), cudaMemcpyHostToDevice);
 
 	printf("\n\nRunning Slant Range Kernel\n");
-	computeSlantRange <<<NUM_BLOCKS, NUM_THREADS >>> (d_AV_Data, d_rangeData ,0);
+	computeSlantRange <<< NUM_BLOCKS, NUM_THREADS >>> (d_AV_Data, d_rangeData ,0);
 	cudaDeviceSynchronize();
 	printf("\nKernel Finished\n\n");
 
@@ -263,10 +317,21 @@ extern "C" void CalcTargetLocation(Aircraft_Data* AV_Data, DTEDFile* DTED_Data)
 	
 }
 
-//Returns the bearing from point 1 to point 2 on the Earth assuming both points are known.
-//Bearing is relative to true north (so it is aligned with our aircraft yaw)
-//All inputs and outputs are in radians
-//Makes no distinction between hemispheres (be careful if each point is in a different hemisphere)
+//===================================================================================================================================================
+//----------------------------------- Perform Location Visibility Scan functions and kernels --------------------------------------------------------
+
+/*===================================================================================================================================================
+	GetBearingBetweenTwoPoints(float lat1, float lon1, float lat2, float lon2)
+
+Description
+	This device function calculates the bearing between two points assuming both points are known. The bearing is relative to true north 
+	(so it is aligned with aircraft	yaw). Makes no distinction between hemispheres. (Be careful if each point is in a different hemisphere)
+Parameters
+	lat1 / lon1 - latitude and longitude of the first point in radians
+	lat2 / lon2 - latitude and longitude of the second point in radians
+Output
+	Returns the bearing from point 1 to point 2
+*/
 __device__ float GetBearingBetweenTwoPoints(float lat1, float lon1, float lat2, float lon2)
 {
 	lat1 = abs(lat1);
@@ -279,8 +344,19 @@ __device__ float GetBearingBetweenTwoPoints(float lat1, float lon1, float lat2, 
 	return (2 * PI) - atan2(x, y);
 }
 
-//Returns an estimated surface distance in meters from point 1 to point 2 using a smooth sphere Earth model
-//A distance function such as this should be accurate enough for very low altitudes (< 16000ft)
+/*===================================================================================================================================================
+	GetGroundDistance_Haversine(float lat1, float lon1, float lat2, float lon2)
+
+Description
+	This device function calculates an estimated surface distance in meters from point 1 to point 2 using a smooth sphere Earth model.  
+	The accuracy of this function should be sufficient for very low altitudes (< 16000ft) and points that are too far apart. Otherwise, 
+	this would not be recommended in practice.
+Parameters
+	lat1 / lon1 - latitude and longitude of the first point in radians
+	lat2 / lon2 - latitude and longitude of the second point in radians
+Output
+	Returns the distance from point 1 to point 2 along a smooth sphere
+*/
 __device__ float GetGroundDistance_Haversine(float lat1, float lon1, float lat2, float lon2)
 {
 	const float EARTH_MEAN_RADIUS = 6371000; //meters
@@ -290,6 +366,29 @@ __device__ float GetGroundDistance_Haversine(float lat1, float lon1, float lat2,
 	return EARTH_MEAN_RADIUS * 2 * atan2(sqrt(a), sqrt(1 - a));
 }
 
+/*===================================================================================================================================================
+	computeVisibility(Aircraft_Data* AV_Data, DTEDFile* DTED_Data)
+
+	TODO:
+	Currently, this function works for some scenarios and doesn't for others.  Not sure why, I might be inadvertently placing the aircraft 
+	"underground" somehow.  Need to investigate.
+
+Description
+	This kernel is used to perform a scan of the entire area covered by the DTED file and marks which locations in the "visible" buffer can be visible 
+	from the aircraft's current location. Each element in the "visible" buffer corresponds to a DTED post (so each element is a known location)
+	within the 1 degree x 1 degree square just like the "elevations" buffer.  Both of these buffers are single dimension and represent each location
+	from the DTED file in order of longitude record of latitude posts.  In this kernel, each thread processes a single DTED post location within the 
+	longitude record. This is repeated for each longitude record across the entire file area. A location is considered visible if the resulting target
+	after calling computeSlantRange() is within a certain threshold of accuracy.
+
+	Visibility is determined by launching the computeSlantRange() kernel for each location tested. This function demonstrates launching a kernel from
+	a kernel.  This also results in a tremendous number of threads and can cause the display driver to restart especially for higher resolution DTED.
+Parameters
+	AV_Data   - pointer to an Aircraft Data structure containing input data (i.e. the aircraft's current location)
+	DTED_Data - pointer to a DTED File Data structure containing data describing the area covered by the DTED file
+Output
+	Each location is marked in the "visible" buffer whether it is visible (true) or not (false).
+*/
 __global__ void computeVisibility(Aircraft_Data* AV_Data, DTEDFile* DTED_Data)
 {
 	const unsigned int index = (blockIdx.x * blockDim.x) + threadIdx.x;
@@ -298,14 +397,15 @@ __global__ void computeVisibility(Aircraft_Data* AV_Data, DTEDFile* DTED_Data)
 	{
 		for (int i = 0; i < DTED_Data->lon_count; i++)
 		{
+			//An Aircraft_Data structure is maintained for each latitude post in the current longitude record under test
+			//The current AV location is copied to it here where it will be used in the computeSlantRange() kernel
 			avData[index].A_altitude = AV_Data->A_altitude;
 			avData[index].A_latitude = AV_Data->A_latitude;
 			avData[index].A_longitude = AV_Data->A_longitude;
 			avData[index].RM = AV_Data->RM;
 			avData[index].RN = AV_Data->RN;
-			avData[index].H_elevation = index;
 
-			//Assume a level state
+			//Assume a level state - we want to know if the location can be visible, not is it visible
 			avData[index].A_yaw = 0;
 			avData[index].A_pitch = 0;
 			avData[index].A_roll = 0;
@@ -331,19 +431,21 @@ __global__ void computeVisibility(Aircraft_Data* AV_Data, DTEDFile* DTED_Data)
 			float groundDistance = GetGroundDistance_Haversine(AV_Data->A_latitude, AV_Data->A_longitude, latitude, longitude);
 			avData[index].A_elevation = (PI / 2) - atan(groundDistance / (AV_Data->A_altitude - elevations[i * DTED_Data->lat_count + index]));
 
-			//Since we assumed a level state
+			//Since we assumed a level state - do a simplified version of the matrix multiplication from calculateABC()
 			avData[index].LOS_Rotation[0] = cos(avData[index].A_azimuth) * cos(avData[index].A_elevation);
 			avData[index].LOS_Rotation[1] = sin(avData[index].A_azimuth) * cos(avData[index].A_elevation);
 			avData[index].LOS_Rotation[2] = sin(avData[index].A_elevation);
 
-			computeSlantRange << <NUM_BLOCKS, NUM_THREADS >> > (avData + index, rangeData + index, index); //launching kernel from kernel
+			//Launch kernel from this kernel to test whether the target location can be seen from the current aircraft location
+			computeSlantRange << <NUM_BLOCKS, NUM_THREADS >> > (avData + index, rangeData + index, index);
 			cudaDeviceSynchronize(); //Wait for all the child kernels to complete before proceeding.
 
+			//Debug
 			//printf("KNOWN TARGET: Iteration: %d | Index: %d | Az: %f | El: %f | Latitude: %f | Longitude: %f | Altitude: %dm\n", i, index, avData[index].A_azimuth * RAD_TO_DEG, avData[index].A_elevation * RAD_TO_DEG, latitude * RAD_TO_DEG, longitude * RAD_TO_DEG, elevations[index]);
 			//printf("INTERSECTION: Latitude: %f | Longitude: %f | Altitude: %f | Range: %dm\n", avData[index].T_latitude * RAD_TO_DEG, avData[index].T_longitude * RAD_TO_DEG, avData[index].T_altitude * METER_TO_FEET, (int)(avData[index].slantRange));
 
-			//printf("Known Lat: %f Lon: %f | Calculated: Lat: %f Lon: %f | Diff: Lat: %f Lon: %f\n",latitude * RAD_TO_ARC, longitude * RAD_TO_ARC, avData[index].T_latitude * RAD_TO_ARC, avData[index].T_longitude * RAD_TO_ARC, abs(latitude - avData[index].T_latitude) * RAD_TO_ARC, abs(longitude - avData[index].T_longitude) * RAD_TO_ARC);
-
+			//If the level of accuracy is within the interval between DTED posts, then assume the location is visible
+			//For level 0 DTED, the inerval is 30 arcseconds.
 			if (abs(latitude - avData[index].T_latitude) * RAD_TO_ARC <= DTED_Data->lat_interval && abs(longitude - avData[index].T_longitude) * RAD_TO_ARC <= DTED_Data->lon_interval)
 			{
 				visible[index + DTED_Data->lat_count * i] = true;
@@ -356,6 +458,18 @@ __global__ void computeVisibility(Aircraft_Data* AV_Data, DTEDFile* DTED_Data)
 	}
 }
 
+/*===================================================================================================================================================
+	printVisibleArea(DTEDFile *data)
+
+Description
+	Copies the "visible" buffer from the device to the host and writes it to a file.
+
+Parameters
+	data - pointer to a DTED File Data structure containing data describing the area covered by the DTED file
+Output
+	The file visibility_output.txt representing the locations from the DTED file. A '-' means that location is not visible and a 'X' means that location
+	is visible from the aircraft's current position.
+*/
 extern "C" void printVisibleArea(DTEDFile *data)
 {
 	FILE* file;
@@ -377,6 +491,24 @@ extern "C" void printVisibleArea(DTEDFile *data)
 	free(h_visible);
 }
 
+/*===================================================================================================================================================
+	CalcAreaVisibility(Aircraft_Data* AV_Data, DTEDFile* DTED_Data)
+
+Description
+	Sets up and launches the computeVisibility() kernel. By default, this kernel launches with 512 threads per block.  The number of blocks is 
+	determined by the number of latitude posts in the longitude record of the DTED.  Each thread processes each latitude post in the longitude 
+	record. The longitude record is advanced on each iteration within the kernel. Each thread has its own Aircraft_Data and DTED_Data structures to
+	facilitate computation.  Each thread also launches the computeSlantRange() kernel to determine if its corresponding location is visible from
+	the aircraft's position.
+
+	DTED level 0 contains 121 latitude posts per longitude record and each thread launches another kernel of default 512 threads bringing the default
+	total thread count to 77312. For higher resolution such as level 1, this would be 1201 * 512 = 614912 threads.
+Parameters
+	AV_Data   - pointer to an Aircraft Data structure containing input data (i.e. the aircraft's current location)
+	DTED_Data - pointer to a DTED File Data structure containing data describing the area covered by the DTED file
+Output
+	Calls printVisibility() which outputs the "visible" buffer to a file.
+*/
 extern "C" void CalcAreaVisibility(Aircraft_Data* AV_Data, DTEDFile* DTED_Data)
 {
 	int num_blocks = DTED_Data->lat_count / VISIBILITY_SCAN_NUM_THREADS;      //Number of blocks needed for computation
@@ -403,8 +535,16 @@ extern "C" void CalcAreaVisibility(Aircraft_Data* AV_Data, DTEDFile* DTED_Data)
 	cudaFree(d_DTED_Data);
 }
 
-//Allocates device memory and copies DTED File elevation data to the device
-//Copy memory address of allocated memory to global pointers only has to be done once.
+/*===================================================================================================================================================
+	LoadElevationData(DTEDFile* DTED_Data)
+
+Description
+	Utility function which allocates device memory for Aircraft data, DTED data, elevation and visible buffers.	Allocates device memory for the 
+	computeSlantRange() and computeVisibility() functions. Copies DTED elevations to device. Copies addresses of device memory buffer to pre-defined
+	device pointers so that the buffers are easier to access later.
+Parameters
+	DTED_Data - pointer to a DTED File Data structure containing data describing the area covered by the DTED file
+*/
 extern "C" void LoadElevationData(DTEDFile* DTED_Data)
 {
 	int total_elements = DTED_Data->lon_count * DTED_Data->lat_count;
@@ -435,7 +575,21 @@ extern "C" void LoadElevationData(DTEDFile* DTED_Data)
 	cudaMemcpyToSymbol(rangeData, &d_rangeData, sizeof(SlantRangeData*)); //Copy this struct pointer to one in global memory so we don't have to pass it in kernel calls*/
 }
 
-extern "C"  void printMatrix(float* matrix, int height, int width)
+//===================================================================================================================================================
+//-------------------------------------------------- Aircraft LOS Vector Rotation Functions ---------------------------------------------------------
+
+/*===================================================================================================================================================
+	printMatrix(float* matrix, int height, int width)
+
+Description
+	Utility for printing out a column ordered matrix. Be aware that the aircraft data is in radians and this function converts to degrees after
+	That is, cos(0) which is 1 in both radians and degrees will display as 180/PI
+Parameters
+	matrix - pointer to the matrix to print out
+	height - height of the matrix
+	width  - width of the matrix
+*/
+extern "C" void printMatrix(float* matrix, int height, int width)
 {
 	for (int r = 0; r < height; r++)
 	{
@@ -447,9 +601,19 @@ extern "C"  void printMatrix(float* matrix, int height, int width)
 	}
 }
 
-//Calculate the rotation matrix which is a 3x1 matrix containing values yaw (A), pitch (B) and roll (C)
-//In memory this is stored simply as a 3 element array
-extern "C"  void calculateABC(Aircraft_Data *Data)
+/*===================================================================================================================================================
+	calculateABC(Aircraft_Data *Data)
+
+Description
+	This function calculates the rotation matrix for the LOS vector based the aircraft attitude.  This function uses cuBLAS to perform the matrix
+	multiplication.
+Parameters
+	Data - pointer to the aircraft data containing both the orientation data input (yaw, pitch, roll, azimuth and elevation)
+Output
+	The calculated rotation matrix for the LOS vector is saved to the LOS_Rotation buffer in the aircraft data.
+	It is a 3x1 matrix containing values yaw (A), pitch (B) and roll (C) stored as a 3 element array.
+*/
+extern "C" void calculateABC(Aircraft_Data *Data)
 {
 	/*
 

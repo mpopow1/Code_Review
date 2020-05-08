@@ -1,16 +1,22 @@
 #include "DTEDFileManager.h"
 
-DTEDFileManager::DTEDFileManager()
-{
-}
+DTEDFileManager::DTEDFileManager(){}
+DTEDFileManager::~DTEDFileManager(){}
 
+/*===================================================================================================================================================
+	GetDTEDFileData(string filename)
 
-DTEDFileManager::~DTEDFileManager()
-{
-}
-
+Description
+	Reads in the header data and elevations data from the Digital Terrain Elevation Data (DTED) file.
+Parameters
+	filename - name of the DTED file
+*/
 bool DTEDFileManager::GetDTEDFileData(string filename)
 {
+	//in bytes
+	const int ELEVATION_DATA_START = 3436;
+	const int RECORD_HEADER_SIZE = 12;
+
 	cout << "Opening File: " << filename << endl;
 	file.open(filename, ifstream::binary);
 
@@ -43,9 +49,6 @@ bool DTEDFileManager::GetDTEDFileData(string filename)
 		data.lon_count = atoi(bytes);
 		file.read(bytes, 4);
 		data.lat_count = atoi(bytes);
-
-#define ELEVATION_DATA_START 3436
-#define RECORD_HEADER_SIZE   12
 		
 		//Get the terrain elevation samples which will be stored as a single dimension array
 		data.elevations = (short*)malloc(sizeof(short) * data.lon_count * data.lat_count);
@@ -61,7 +64,6 @@ bool DTEDFileManager::GetDTEDFileData(string filename)
 					file.read(&(sample[1]), 1); //In the DTED file, the elevation is stored in Big Endian format
 					file.read(&(sample[0]), 1); //swap the bytes for each elevation sample.
 					data.elevations[lon_record * data.lon_count + lat_post] = *((short*)sample);
-					//printf("position: %d | index: %d | elevation: %d\n", (int)file.tellg(),lon_record * data.lon_count + lat_post, *((short*)sample));
 				}
 			}
 		}
@@ -81,6 +83,14 @@ bool DTEDFileManager::GetDTEDFileData(string filename)
 	return false;
 }
 
+/*===================================================================================================================================================
+	PrintFileData(int num_elevations)
+
+Description
+	Utility function to print out the data that was read in from the DTED file.
+Parameters
+	num_elevations - number of elevation samples to print out.
+*/
 void DTEDFileManager::PrintFileData(int num_elevations)
 {
 	int nw_corner_lat, nw_corner_lon;
